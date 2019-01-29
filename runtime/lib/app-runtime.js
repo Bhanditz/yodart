@@ -857,7 +857,7 @@ AppRuntime.prototype.registerDbusApp = function (appId, objectPath, ifaceName) {
       objectPath: objectPath,
       ifaceName: ifaceName,
       skills: [ appId ],
-      permission: ['ACCESS_TTS', 'ACCESS_MULTIMEDIA']
+      permission: []
     }, {
       dbusApp: true
     })
