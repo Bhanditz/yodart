@@ -17,7 +17,6 @@ var ComponentConfig = require('/etc/yoda/component-config.json')
 
 var _ = require('@yoda/util')._
 var deprecate = require('@yoda/util/deprecate')
-var wifi = require('@yoda/wifi')
 var property = require('@yoda/property')
 var system = require('@yoda/system')
 var env = require('@yoda/env')()
@@ -121,7 +120,6 @@ AppRuntime.prototype.init = function init () {
     }
     return future.then(() => {
       this.enableRuntimeFor('welcoming')
-      this.component.custodian.prepareNetwork()
     }).catch(err => {
       logger.error('unexpected error on boot welcoming', err.stack)
       this.enableRuntimeFor('welcoming')
@@ -211,13 +209,21 @@ AppRuntime.prototype.startDaemonApps = function startDaemonApps () {
  */
 AppRuntime.prototype.handleCloudEvent = function handleCloudEvent (code, msg) {
   logger.debug(`cloud event code=${code} msg=${msg}`)
-  if (this.component.custodian.isRegistering() &&
-    this.component.custodian.isConfiguringNetwork()) {
-    this.openUrl(`yoda-skill://network/cloud_status?code=${code}&msg=${msg}`, {
-      preemptive: false
-    })
-  } else {
-    logger.info('skip send to network.')
+
+  var _code = parseInt(code)
+  if (_code === 100) {
+    logger.info('logging ...')
+    return
+  } else if (_code === 101) {
+    logger.info('login success')
+    return
+  } else if (_code === 201) {
+    logger.info('bind master success')
+    //this.onLoginSuccess()
+  } else if (_code === -101) {
+    logger.info('login failed')
+  } else if (_code === -202) {
+    logger.info('bind master failed')
   }
 }
 
@@ -236,7 +242,7 @@ AppRuntime.prototype.handlePowerActivation = function handlePowerActivation () {
    */
   var future = this.resetServices({ lightd: false })
 
-  if (currentAppId == null && !this.component.custodian.isPrepared()) {
+  if (currentAppId == null && !this.component.custodian.isLoggedIn()) {
     // guide user to configure network but not start network app directly
     return future.then(() => this.component.light.ttsSound('@yoda', 'system://guide_config_network.ogg'))
   }
@@ -388,7 +394,6 @@ AppRuntime.prototype.wakeup = function wakeup (options) {
   this.component.turen.toggleWakeUpEngine(true)
 
   this.component.custodian.resetState()
-  this.component.custodian.prepareNetwork()
 }
 
 /**
@@ -398,11 +403,6 @@ AppRuntime.prototype.playLongPressMic = function lightLoadFile () {
   this.shouldStopLongPressMicLight = true
   if (this.component.sound.isMuted()) {
     this.component.sound.unmute()
-  }
-
-  // reset network if current is at network app.
-  if (this.component.custodian.isConfiguringNetwork()) {
-    return this.openUrl('yoda-skill://network/renew')
   }
 
   // In order to play sound when currently is muted
@@ -457,7 +457,7 @@ AppRuntime.prototype.resetNetwork = function resetNetwork (options) {
   return Promise.all([
     this.component.lifetime.destroyAll(),
     this.setMicMute(false, { silent: true })
-  ]).then(() => this.component.custodian.resetNetwork(options))
+  ]).then(() => this.component.custodian.reConfigureNetwork())
     .then(() => {
       // todo lightd will not display setupNetwork.js sometime, so we need to stop longPressMic in timeout.
       // we need to refactor it
@@ -1094,13 +1094,9 @@ AppRuntime.prototype.multimediaMethod = function (name, args) {
  * @private
  */
 AppRuntime.prototype.reconnect = function () {
-  wifi.resetDns()
   this.dispatchNotification('on-network-connected', [])
   logger.log('received the wifi is online, reset DNS config.')
 
-  if (this.component.custodian.isConfiguringNetwork()) {
-    return this.openUrl(`yoda-skill://network/connected`, { preemptive: false })
-  }
   return this.login()
 }
 
@@ -1124,12 +1120,11 @@ AppRuntime.prototype.login = _.singleton(function login (options) {
     }
 
     // login -> mqtt
-    this.component.custodian.onLogout()
     return this.cloudApi.connect(masterId)
       .then(this.onLoggedIn.bind(this), (err) => {
         if (err && err.code === 'BIND_MASTER_REQUIRED') {
           logger.error('bind master is required, just clear the local and enter network')
-          this.component.custodian.resetNetwork()
+          this.component.custodian.reConfigureNetwork()
         } else {
           logger.error('initializing occurs error', err && err.stack)
         }

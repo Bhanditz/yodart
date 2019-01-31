@@ -2,7 +2,7 @@
 
 var bluetooth = require('@yoda/bluetooth')
 var logger = require('logger')('bluetooth-app')
-var wifi = require('@yoda/wifi')
+var Network = require('@yoda/network')
 var util = require('util')
 var _ = require('@yoda/util')._
 var system = require('@yoda/system')
@@ -26,7 +26,9 @@ module.exports = function (activity) {
   var timer = null
   var callState = protocol.CALL_STATE.IDLE
   var deviceProps = null
-  var agent = null
+  var agent = new flora.Agent('unix:/var/run/flora.sock')
+  agent.start()
+  var network = new Network(agent)
   var currentSkillName = 'bluetooth'
 
   function setAppType (skillName, afterFunc) {
@@ -108,14 +110,18 @@ module.exports = function (activity) {
     logger.debug(`speak: ${text}`)
     if (!textIsEmpty(text)) {
       return activity.setForeground().then(() => {
-        if (wifi.getWifiState() === wifi.WIFI_CONNECTED) {
-          return activity.tts.speak(text, { impatient: false }).catch((err) => {
-            logger.error('play tts error: ', err)
-          })
-        } else if (alternativeVoice != null) {
-          logger.debug('No wifi connection, play alternative voice.')
-          return activity.playSound(alternativeVoice)
-        }
+        this.network.getStatus('NETWORK').then((reply) => {
+          var msg = JSON.parse(reply.msg[0])
+          logger.debug(msg)
+          if (msg.state === Network.CONNECTED) {
+            return activity.tts.speak(text, { impatient: false }).catch((err) => {
+              logger.error('play tts error: ', err)
+            })
+          } else if (alternativeVoice != null) {
+            logger.debug('No wifi connection, play alternative voice.')
+            return activity.playSound(alternativeVoice)
+          }
+        })
       }).then(afterSpeak)
     }
   }
@@ -640,9 +646,7 @@ module.exports = function (activity) {
     hfp.on('call_state_changed', onCallStateChangedListener)
     activity.keyboard.on('click', onKeyEvent)
     activity.setContextOptions({ keepAlive: true })
-    agent = new flora.Agent('unix:/var/run/flora.sock')
     agent.subscribe('yodart.audio.on-volume-change', onDeviceVolumeChanged)
-    agent.start()
   })
 
   activity.on('ready', () => {

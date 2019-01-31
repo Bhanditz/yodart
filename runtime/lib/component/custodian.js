@@ -1,238 +1,232 @@
 var logger = require('logger')('custodian')
 var property = require('@yoda/property')
-var wifi = require('@yoda/wifi')
-var _ = require('@yoda/util')._
+var Network = require('@yoda/network')
+var bluetooth = require('@yoda/bluetooth')
+
+var RuntimeState = {
+  RAW_NETWORK: 0,
+  CONFIGURING_NETWORK: 1,
+  CONNECTING_NETWORK: 2,
+  LOGGING: 3,
+  LOGGED_IN: 4,
+}
 
 module.exports = Custodian
+
 function Custodian (runtime) {
-  wifi.enableScanPassively()
   this.runtime = runtime
   this.component = runtime.component
+  this.masterId = null
 
-  /**
-   * set this._networkConnected = undefined at initial to
-   * prevent discarding of very first of network disconnect event.
-   */
-  this._networkConnected = undefined
-  /**
-   * this._checkingNetwork sets the current network is checking,
-   * it should be checked at onNetworkConnect, when it doesn't get
-   * down.
-   */
-  this._checkingNetwork = false
-  /**
-   * this._loggedIn could be used to determine if current session
-   * is once connected to internet.
-   */
-  this._loggedIn = false
+  this.runtimeState = RuntimeState.RAW_NETWORK
+  this.networkDisconnOccur = null
+  this.networkDisconnInterval = 10 * 1000
+
+  this.network = new Network(this.component.flora, true)
+  this.initNetwork()
+
+  this.bluetoothStream = bluetooth.getMessageStream()
+  this.bleOpened = false
+  this.bleTimer = null
+  this.bleMaxAlive = 180 * 1000
+  this.initBluetooth()
 }
 
-/**
- * Fires when the network is connected.
- * @private
- */
-Custodian.prototype.onNetworkConnect = function onNetworkConnect () {
-  if (this._networkConnected || this._checkingNetwork) {
-    return
-  }
-  property.set('state.network.connected', 'true')
+Custodian.prototype.reConfigureNetwork = function () {
+  this.runtimeState = RuntimeState.CONFIGURING_NETWORK
+  this.openBluetooth()
+}
 
-  this._networkConnected = true
-  logger.info('on network connect and checking internet connection.')
+Custodian.prototype.resetState = function () {
+  this.runtimeState = RuntimeState.RAW_NETWORK
+}
 
-  // start checking the internet connection
-  this._checkingNetwork = true
-  wifi.checkNetwork(10 * 1000, (err, connected) => {
-    this._checkingNetwork = false
-    if (err || !connected) {
-      logger.error('check: failed to get connected on the current wifi.')
-      this.onNetworkDisconnect()
+Custodian.prototype.isConfiguringNetwork = function () {
+  return this.runtimeState === RuntimeState.CONFIGURING_NETWORK
+}
+
+Custodian.prototype.isLogging = function () {
+  return this.runtimeState === RuntimeState.LOGGING
+}
+
+Custodian.prototype.isLoggedIn = function () {
+  return this.runtimeState === RuntimeState.LOGGED_IN
+}
+
+Custodian.prototype.onLoggedIn = function () {
+  this.runtimeState = RuntimeState.LOGGED_IN
+  this.network.wifiStopScan()
+  this.closeBluetooth(0, { topic: 'bind', sCode: code, sMsg: msg })
+}
+
+Custodian.prototype.initNetwork = function () {
+  this.network.subscribe()
+
+  this.network.on('network.status', function (status) {
+    if (status.state === Network.CONNECTED) {
+      /**
+        * Start login when received event that network has connected
+        */
+      if (this.networkDisconnOccur)
+        this.networkDisconnOccur = null
+
+      if (this.runtimeState === RuntimeState.CONNECTING_NETWORK ||
+          this.runtimeState === RuntimeState.RAW_NETWORK) {
+        property.set('state.network.connected', 'true')
+
+        if (this.masterId) {
+          this.runtime.login({ masterId: this.masterId })
+        } else {
+          this.runtime.login()
+        }
+        this.runtimeState = RuntimeState.LOGGING
+        logger.info(`connecting masterId=${this.masterId} is set`)
+      }
+    } else if (status.state === Network.DISCONNECTED) {
+      /**
+        * Reset runtimeState when received event that network is
+        * disconnected continuously in ten seconds
+        */
+      if (this.networkDisconnOccur === null) {
+        this.networkDisconnOccur = Date.now()
+      } else if (Date.now() - this.networkDisconnOccur
+        > this.networkDisconnInterval) {
+        this.networkDisconnInterval = null
+        property.set('state.network.connected', 'false')
+        this.runtimeState = RuntimeState.RAW_NETWORK
+      }
+    }
+  }.bind(this))
+
+  this.network.triggerStatus()
+
+  /**
+   * TODO: re-configure network when wpa_supplicant.conf does not exists
+   */
+  //setTimeout(() => {
+  //  if (this.runtimeState === RuntimeState.RAW_NETWORK) {
+  //    this.reConfigureNetwork()
+  //  }
+  //}.bind(this), 15 * 1000)
+}
+
+Custodian.prototype.initBluetooth = function () {
+  this.bluetoothStream.on('handshaked', () => {
+    this.component.light.appSound('@yoda', 'system://ble_connected.ogg')
+    logger.debug('ble device connected')
+  }.bind(this))
+
+  this.bluetoothStream.on('disconnected', () => {
+    logger.debug('ble device disconnected')
+  }.bind(this))
+
+  this.bluetoothStream.on('data', function (message) {
+    logger.debug(message)
+
+    if (message.topic === 'getCapacities') {
+      this.network.capacities().then((reply) => {
+        var msg = JSON.parse(reply.msg[0])
+        this.bluetoothStream.write({topic: 'getCapacities', data: msg})
+      })
+
+    } else if (message.topic === 'getWifiList') {
+      this.network.wifiScanList().then((reply) => {
+        var msg = JSON.parse(reply.msg[0])
+
+        var wifiList = msg.wifilist.map((item) => {
+          return {S: item.SSID, L: item.SIGNAL}
+        })
+
+        this.bluetoothStream.write({topic: 'getWifiList', data: wifiList})
+      })
+
+    } else if (message.topic === 'bind') {
+      this.masterId = message.data.U
+      this.runtimeState = RuntimeState.CONNECTING_NETWORK
+      this.network.wifiOpen(message.data.S, message.data.P).then((reply) => {
+        this.runtime.dispatchNotification('on-network-connected', [])
+
+        property.set('persist.netmanager.wifi', 1)
+        property.set('persist.netmanager.wifi_ap', 0)
+        this.component.light.appSound(
+          '@yoda', 'system://prepare_connect_wifi.ogg')
+        this.bluetoothStream.write(
+          {topic: 'bind', sCode: '11', sMsg: 'wifi连接成功'})
+      }, (err) => {
+        property.set('persist.netmanager.wifi', 0)
+        this.component.light.appSound(
+          '@yoda', 'system://wifi/connect_timeout.ogg')
+        this.bluetoothStream.write(
+          {topic: 'bind', sCode: '-12', sMsg: 'wifi连接超时'})
+      })
+
+    } else if (message.topic === 'bindModem') {
+      this.network.modemOpen().then((reply) => {
+        property.set('persist.netmanager.modem', 'true')
+        // FIXME: play modem/connect_failed.ogg instead
+        this.component.light.appSound(
+          '@yoda', 'system://prepare_connect_wifi.ogg')
+        this.bluetoothStream.write(
+          {topic: 'bindModem', sCode: '11', sMsg: 'modem连接成功'})
+      }, (err) => {
+        property.set('persist.netmanager.modem', 'false')
+        // FIXME: play modem/connect_failed.ogg instead
+        this.component.light.appSound(
+          '@yoda', 'system://wifi/connect_timeout.ogg')
+        this.bluetoothStream.write(
+          {topic: 'bindModem', sCode: '-12', sMsg: 'modem连接失败'})
+      })
+    }
+  }.bind(this))
+}
+
+Custodian.prototype.openBluetooth = function () {
+  var uuid = (property.get('ro.boot.serialno') || '').substr(-6)
+  var productName = property.get('ro.rokid.build.productname') || 'Rokid-Me'
+  var BLE_NAME = [ productName, uuid ].join('-')
+
+  this.bluetoothStream.start(BLE_NAME, (err) => {
+    if (err) {
+      logger.info('open ble failed, name', BLE_NAME)
+      logger.error(err && err.stack)
       return
     }
-    logger.info('check: dns is working and start login / bind.')
-    this.runtime.reconnect()
+
+    this.bleOpened = true
+    this.component.light.appSound('@yoda', 'system://wifi/setup_network.ogg')
+    this.component.light.play(
+      '@yoda', 'system://setStandby.js', {}, { shouldResume: true })
+    logger.info('open ble success, name', BLE_NAME)
   })
 
-  var appMap = this.component.appScheduler.appMap
-  Object.keys(appMap).forEach(key => {
-    var activity = appMap[key]
-    activity.emit('internal:network-connected')
-  })
+  this.closeBluetooth(this.bleMaxAlive)
 }
 
-/**
- * Fires when the network is disconnected.
- * @private
- */
-Custodian.prototype.onNetworkDisconnect = function onNetworkDisconnect () {
-  if (this._networkConnected === false) {
+Custodian.prototype.closeBluetooth = function (delaySecond, msg) {
+  if (msg) {
+    this.bluetoothStream.write(msg)
+  }
+
+  clearTimeout(this.bleTimer)
+  this.bleTimer = setTimeout(() => {
+    this.bleOpened = false
+    this.component.light.stop('@yoda', 'system://setStandby.js')
+    if (delaySecond === 0) {
+      setTimeout(() => this.bluetoothStream.end(), 2000)
+    }
+  }, delaySecond)
+}
+
+Custodian.prototype.turenDidWakeUp = function () {
+  if (this.runtimeState !== RuntimeState.RAW_NETWORK) {
     return
   }
-  property.set('state.network.connected', 'false')
-  this._networkConnected = false
-  logger.info('on network disconnect, once logged in?', this._loggedIn)
-
-  if (this.isConfiguringNetwork()) {
-    logger.info('current is configuring network, just skip the disconnect open')
-    return
-  }
-
-  if (wifi.getNumOfHistory() > 0) {
-    logger.log('network switch, try to reconnect, waiting for user awake or button event')
-    wifi.enableScanPassively()
-    return
-  }
-
-  /**
-   * If no history found, we should reset network state and goto network automatically.
-   */
-  logger.log('network disconnected and no history found')
-  logger.log('reset network and goto network to config')
-  this.runtime.resetNetwork({ removeAll: true })
-}
-
-Custodian.prototype.onLoggedIn = function onLoggedIn () {
-  this._loggedIn = true
-  property.set('state.rokid.logged', 'true')
-  logger.info('on logged in')
-}
-
-Custodian.prototype.onLogout = function onLogout () {
-  this._loggedIn = false
-  this.component.wormhole.setOffline()
-  property.set('state.rokid.logged', 'false')
-  this.runtime.credential = {}
-  logger.info('on logged out and clear the credential state')
-}
-
-/**
- * Reset network and start procedure of configuring network.
- *
- * @param {object} [options] -
- * @param {boolean} [options.removeAll] - remove local wifi config?
- */
-Custodian.prototype.resetNetwork = function resetNetwork (options) {
-  logger.log('reset network')
-  var removeAll = _.get(options, 'removeAll')
-  wifi.resetWifi()
-  if (removeAll) {
-    wifi.removeAll()
-  } else {
-    wifi.disableAll()
-  }
-  property.set('state.network.connected', 'false')
-
-  this._networkConnected = false
-  return this.runtime.openUrl('yoda-skill://network/setup', { preemptive: true })
-}
-
-/**
- * Determines network is connected also runtime was logged in.
- */
-Custodian.prototype.isPrepared = function isPrepared () {
-  return this._networkConnected && this._loggedIn
-}
-
-/**
- * Determines if network is unavailable.
- */
-Custodian.prototype.isNetworkUnavailable = function isNetworkUnavailable () {
-  return !this._networkConnected
-}
-
-/**
- * Determines network is connected yet runtime is registering with Rokid services.
- */
-Custodian.prototype.isRegistering = function isRegistering () {
-  return this._networkConnected && !this._loggedIn
-}
-
-/**
- * Determines runtime is once logged in and has not been reset.
- */
-Custodian.prototype.isLoggedIn = function isLoggedIn () {
-  return this._loggedIn
-}
-
-/**
- * Determines if network configuring app is currently active app.
- */
-Custodian.prototype.isConfiguringNetwork = function isConfiguringNetwork () {
-  return this.component.lifetime.getCurrentAppId() === '@yoda/network'
-}
-
-Custodian.prototype.prepareNetwork = function prepareNetwork () {
-  if (wifi.getWifiState() === wifi.WIFI_CONNECTED) {
-    return this.onNetworkConnect()
-  }
-  if (wifi.getNumOfHistory() > 0) {
-    logger.info('has histroy wifi, just skip')
-    return
-  }
-  return this.onNetworkDisconnect()
-}
-
-Custodian.prototype.resetState = function resetState () {
-  /**
-   * set this._networkConnected = undefined at initial to
-   * prevent discarding of very first of network disconnect event.
-   */
-  this._networkConnected = undefined
-}
-
-// MARK: - Interception
-Custodian.prototype.turenDidWakeUp = function turenDidWakeUp () {
-  if (this.isPrepared()) {
-    return
-  }
-  logger.warn('Network not connected, preparing to announce unavailability.')
   this.component.turen.pickup(false)
 
-  var currentAppId = this.component.lifetime.getCurrentAppId()
-  if (this.component.custodian.isConfiguringNetwork()) {
-    /**
-     * Configuring network, delegates event to network app.
-     */
-    logger.info('configuring network, renewing timer.')
-    return this.runtime.openUrl('yoda-skill://network/renew')
-  }
-
-  if (wifi.getNumOfHistory() === 0) {
-    if (currentAppId) {
-      /**
-       * although there is no WiFi history, yet some app is running out there,
-       * continuing currently app.
-       */
-      logger.info('no WiFi history exists, continuing currently running app.')
-      return this.component.light.ttsSound('@yoda', 'system://guide_config_network.ogg')
-        .then(() =>
-        /** awaken is not set for no network available, recover media directly */
-          this.component.turen.recoverPausedOnAwaken()
-        )
-    }
-    /**
-     * No WiFi connection history found, introduce device setup procedure.
-     */
-    logger.info('no WiFi history exists, announcing guide to network configuration.')
-    return this.component.light.ttsSound('@yoda', 'system://guide_config_network.ogg')
-      .then(() =>
-        /** awaken is not set for no network available, recover media directly */
-        this.component.turen.recoverPausedOnAwaken()
-      )
-  }
-
-  /**
-   * if runtime is logging in or network is unavailable,
-   * and there is WiFi history existing,
-   * announce WiFi is connecting.
-   */
-  logger.info('announcing network connecting on voice coming.')
-  wifi.enableScanPassively()
-  return this.component.light.ttsSound('@yoda', 'system://wifi_is_connecting.ogg')
-    .then(() =>
+  logger.info('Network not connected, announcing guide to network configuration.')
+  return this.component.light.ttsSound(
+    '@yoda', 'system://guide_config_network.ogg').then(() =>
       /** awaken is not set for no network available, recover media directly */
       this.component.turen.recoverPausedOnAwaken()
     )
 }
-
-// MARK: - END Interception
