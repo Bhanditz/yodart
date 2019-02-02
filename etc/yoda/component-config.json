@@ -2,6 +2,7 @@
   "paths": ["/usr/yoda/lib/component"],
   "interception": {
     "runtimeDidLogin": [ "ota.runtimeDidLogin" ],
+    "runtimeDidWakeup": [ "customConfig.runtimeDidWakeup" ],
     "turenDidWakeUp": [
       "battery.delegateWakeUpIfDangerousStatus",
       "custodian.turenDidWakeUp",
