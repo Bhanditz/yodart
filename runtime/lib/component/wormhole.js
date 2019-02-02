@@ -157,6 +157,19 @@ Wormhole.prototype.handlers = {
    * @member reset_settings
    */
   reset_settings: function (data) {
+    /**
+     * RESET_OK = "0"
+     * RESET_FAILED_NOPOWER = "1"
+     * RESET_FAILED_SYS_LAUNCHING = "2"
+     * RESET_FAILED_SYS_SLEEP = "3"
+     * RESET_FAILED_SYS_OFF = "4"
+     * RESET_FAILED_SYS_UNKNOWN = "-1"
+     */
+    var result = '0'
+    if (this.runtime.hibernated) {
+      result = '3'
+    }
+    this.sendToApp('reset_settings', result)
     this.runtime.onResetSettings()
   },
   /**
